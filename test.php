@@ -23,6 +23,19 @@ $conn->query("CREATE TABLE IF NOT EXISTS users (
 $conn->query("ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(100)");
 $conn->query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(150) UNIQUE");
 $conn->query("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(30)");
+$conn->query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at DATETIME NULL");
+$conn->query("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified_at DATETIME NULL");
+$conn->query("CREATE TABLE IF NOT EXISTS verification_codes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    purpose VARCHAR(50),
+    channel VARCHAR(20),
+    target VARCHAR(150),
+    code_hash VARCHAR(255),
+    expires_at DATETIME,
+    consumed_at DATETIME NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_verification_lookup (purpose, target(100), consumed_at, expires_at)
+)");
 $conn->query("CREATE TABLE IF NOT EXISTS trips (
     id INT AUTO_INCREMENT PRIMARY KEY, 
     user_id INT, 
@@ -61,6 +74,15 @@ $conn->query("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS participants INT DEF
 
 $error = '';
 $success = '';
+$auth_panel = 'login';
+$recovery_result = null;
+$form_values = [
+    'reg_name' => '',
+    'reg_username' => '',
+    'reg_email' => '',
+    'reg_phone' => '',
+    'find_email' => '',
+];
 
 // ── 헬퍼 함수 ──────────────────────────────────────────────
 function e(string $value): string {
@@ -100,18 +122,196 @@ function isValidPhone(string $phone): bool {
     return (bool) preg_match('/^01[016789]-?\\d{3,4}-?\\d{4}$/', $phone);
 }
 
+function normalizePhone(string $phone): string {
+    return preg_replace('/\D+/', '', $phone);
+}
+
 function isValidUsername(string $username): bool {
     return (bool) preg_match('/^[A-Za-z0-9_]{4,20}$/', $username);
 }
 
+function generateVerificationCode(): string {
+    return (string) random_int(100000, 999999);
+}
+
+function saveVerificationCode(mysqli $conn, string $purpose, string $channel, string $target, string $code): void {
+    $stmt = $conn->prepare("INSERT INTO verification_codes (purpose, channel, target, code_hash, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 10 MINUTE))");
+    $hash = password_hash($code, PASSWORD_DEFAULT);
+    $stmt->bind_param('ssss', $purpose, $channel, $target, $hash);
+    $stmt->execute();
+    $stmt->close();
+}
+
+function verifyCode(mysqli $conn, string $purpose, string $target, string $code, bool $consume = false): bool {
+    $stmt = $conn->prepare("SELECT id, code_hash FROM verification_codes WHERE purpose=? AND target=? AND consumed_at IS NULL AND expires_at >= NOW() ORDER BY id DESC LIMIT 1");
+    $stmt->bind_param('ss', $purpose, $target);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    if (!$row || !password_verify($code, $row['code_hash'])) {
+        return false;
+    }
+
+    if ($consume) {
+        $up = $conn->prepare("UPDATE verification_codes SET consumed_at=NOW() WHERE id=?");
+        $id = (int) $row['id'];
+        $up->bind_param('i', $id);
+        $up->execute();
+        $up->close();
+    }
+
+    return true;
+}
+
+function sendVerificationEmail(string $email, string $code): bool {
+    $subject = 'Travel Ledger 인증번호';
+    $message = "Travel Ledger 인증번호는 {$code} 입니다.\n10분 안에 입력해주세요.";
+    $headers = "From: no-reply@travel-ledger.local\r\nContent-Type: text/plain; charset=UTF-8";
+
+    return @mail($email, $subject, $message, $headers);
+}
+
+function maskPhone(string $phone): string {
+    $digits = normalizePhone($phone);
+    if (strlen($digits) < 8) {
+        return $phone;
+    }
+
+    return substr($digits, 0, 3) . '-****-' . substr($digits, -4);
+}
+
+// ── 인증번호 발송 / 계정 찾기 ─────────────────────────────
+if (isset($_POST['send_reg_email_code'])) {
+    $auth_panel = 'register';
+    $form_values['reg_name'] = trim($_POST['reg_name'] ?? '');
+    $form_values['reg_username'] = trim($_POST['reg_username'] ?? '');
+    $form_values['reg_email'] = trim($_POST['reg_email'] ?? '');
+    $form_values['reg_phone'] = trim($_POST['reg_phone'] ?? '');
+
+    if (!filter_var($form_values['reg_email'], FILTER_VALIDATE_EMAIL)) {
+        $error = '인증번호를 받을 이메일을 올바르게 입력해주세요.';
+    } else {
+        $stmt = $conn->prepare("SELECT id FROM users WHERE email=? LIMIT 1");
+        $stmt->bind_param('s', $form_values['reg_email']);
+        $stmt->execute();
+        $exists = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        if ($exists) {
+            $error = '이미 사용 중인 이메일입니다.';
+        } else {
+            $code = generateVerificationCode();
+            saveVerificationCode($conn, 'register_email', 'email', $form_values['reg_email'], $code);
+            $sent = sendVerificationEmail($form_values['reg_email'], $code);
+            $success = $sent
+                ? '이메일 인증번호를 보냈습니다. 10분 안에 입력해주세요.'
+                : '메일 발송 설정이 없어 개발 확인용 인증번호를 표시합니다: ' . $code;
+        }
+    }
+}
+
+if (isset($_POST['send_reg_phone_code'])) {
+    $auth_panel = 'register';
+    $form_values['reg_name'] = trim($_POST['reg_name'] ?? '');
+    $form_values['reg_username'] = trim($_POST['reg_username'] ?? '');
+    $form_values['reg_email'] = trim($_POST['reg_email'] ?? '');
+    $form_values['reg_phone'] = trim($_POST['reg_phone'] ?? '');
+    $phone_target = normalizePhone($form_values['reg_phone']);
+
+    if (!isValidPhone($form_values['reg_phone'])) {
+        $error = '인증번호를 받을 전화번호를 올바르게 입력해주세요.';
+    } else {
+        $code = generateVerificationCode();
+        saveVerificationCode($conn, 'register_phone', 'phone', $phone_target, $code);
+        $success = '휴대폰 인증번호를 발급했습니다. 개발 환경 인증번호: ' . $code;
+    }
+}
+
+if (isset($_POST['send_recovery_email_code'])) {
+    $auth_panel = 'recovery';
+    $form_values['find_email'] = trim($_POST['find_email'] ?? '');
+
+    if (!filter_var($form_values['find_email'], FILTER_VALIDATE_EMAIL)) {
+        $error = '가입한 이메일을 올바르게 입력해주세요.';
+    } else {
+        $stmt = $conn->prepare("SELECT id FROM users WHERE email=? LIMIT 1");
+        $stmt->bind_param('s', $form_values['find_email']);
+        $stmt->execute();
+        $exists = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        if (!$exists) {
+            $error = '해당 이메일로 가입된 계정을 찾을 수 없습니다.';
+        } else {
+            $code = generateVerificationCode();
+            saveVerificationCode($conn, 'account_recovery', 'email', $form_values['find_email'], $code);
+            $sent = sendVerificationEmail($form_values['find_email'], $code);
+            $success = $sent
+                ? '계정 찾기 인증번호를 이메일로 보냈습니다.'
+                : '메일 발송 설정이 없어 개발 확인용 인증번호를 표시합니다: ' . $code;
+        }
+    }
+}
+
+if (isset($_POST['recover_account'])) {
+    $auth_panel = 'recovery';
+    $form_values['find_email'] = trim($_POST['find_email'] ?? '');
+    $recovery_code = trim($_POST['recovery_email_code'] ?? '');
+    $new_password_raw = $_POST['recovery_new_password'] ?? '';
+    $new_password_confirm_raw = $_POST['recovery_new_password_confirm'] ?? '';
+
+    if (!filter_var($form_values['find_email'], FILTER_VALIDATE_EMAIL)) {
+        $error = '가입한 이메일을 올바르게 입력해주세요.';
+    } elseif (!verifyCode($conn, 'account_recovery', $form_values['find_email'], $recovery_code, false)) {
+        $error = '이메일 인증번호가 올바르지 않거나 만료되었습니다.';
+    } else {
+        $stmt = $conn->prepare("SELECT id, username, name, email, phone, created_at FROM users WHERE email=? LIMIT 1");
+        $stmt->bind_param('s', $form_values['find_email']);
+        $stmt->execute();
+        $recovery_result = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        if (!$recovery_result) {
+            $error = '계정 정보를 찾을 수 없습니다.';
+        } elseif ($new_password_raw !== '' || $new_password_confirm_raw !== '') {
+            if (!isValidPassword($new_password_raw)) {
+                $error = '새 비밀번호는 8~20자이며 영문, 숫자, 특수문자를 모두 포함해야 합니다.';
+            } elseif ($new_password_raw !== $new_password_confirm_raw) {
+                $error = '새 비밀번호 확인이 일치하지 않습니다.';
+            } else {
+                $hashedPassword = password_hash($new_password_raw, PASSWORD_DEFAULT);
+                $up = $conn->prepare("UPDATE users SET password=? WHERE id=?");
+                $uid = (int) $recovery_result['id'];
+                $up->bind_param('si', $hashedPassword, $uid);
+                $up->execute();
+                $up->close();
+                verifyCode($conn, 'account_recovery', $form_values['find_email'], $recovery_code, true);
+                $success = '회원정보를 확인했고 비밀번호를 새로 설정했습니다. 이제 로그인해주세요.';
+            }
+        } else {
+            $success = '이메일 인증이 완료되었습니다. 아래 회원정보를 확인해주세요.';
+        }
+    }
+}
+
 // ── 회원가입 ───────────────────────────────────────────────
 if (isset($_POST['register'])) {
+    $auth_panel = 'register';
     $name_raw     = trim($_POST['reg_name'] ?? '');
     $username_raw = trim($_POST['reg_username'] ?? '');
     $email_raw    = trim($_POST['reg_email'] ?? '');
     $phone_raw    = trim($_POST['reg_phone'] ?? '');
     $password_raw = $_POST['reg_password'] ?? '';
     $password_confirm_raw = $_POST['reg_password_confirm'] ?? '';
+    $email_code_raw = trim($_POST['reg_email_code'] ?? '');
+    $phone_code_raw = trim($_POST['reg_phone_code'] ?? '');
+    $phone_target = normalizePhone($phone_raw);
+
+    $form_values['reg_name'] = $name_raw;
+    $form_values['reg_username'] = $username_raw;
+    $form_values['reg_email'] = $email_raw;
+    $form_values['reg_phone'] = $phone_raw;
 
     if ($name_raw === '' || utf8_length($name_raw) < 2) {
         $error = '이름은 2자 이상 입력해주세요.';
@@ -125,14 +325,21 @@ if (isset($_POST['register'])) {
         $error = '비밀번호는 8~20자이며 영문, 숫자, 특수문자를 모두 포함해야 합니다.';
     } elseif ($password_raw !== $password_confirm_raw) {
         $error = '비밀번호 확인이 일치하지 않습니다.';
+    } elseif (!verifyCode($conn, 'register_email', $email_raw, $email_code_raw, false)) {
+        $error = '이메일 인증번호가 올바르지 않거나 만료되었습니다.';
+    } elseif (!verifyCode($conn, 'register_phone', $phone_target, $phone_code_raw, false)) {
+        $error = '휴대폰 인증번호가 올바르지 않거나 만료되었습니다.';
     } else {
         $password = password_hash($password_raw, PASSWORD_DEFAULT);
         // [FIX] Prepared Statement 사용
-        $stmt = $conn->prepare("INSERT INTO users (username, name, email, phone, password) VALUES (?, ?, ?, ?, ?)");
+        $stmt = $conn->prepare("INSERT INTO users (username, name, email, phone, password, email_verified_at, phone_verified_at) VALUES (?, ?, ?, ?, ?, NOW(), NOW())");
         $stmt->bind_param('sssss', $username_raw, $name_raw, $email_raw, $phone_raw, $password);
         try {
             if ($stmt->execute()) {
-                $success = '회원가입 완료! 로그인해주세요.';
+                verifyCode($conn, 'register_email', $email_raw, $email_code_raw, true);
+                verifyCode($conn, 'register_phone', $phone_target, $phone_code_raw, true);
+                $auth_panel = 'login';
+                $success = '이메일과 휴대폰 인증이 완료되었습니다. 로그인해주세요.';
             } else {
                 $error = 'DB 오류가 발생했습니다.';
             }
@@ -465,7 +672,7 @@ $category_colors = [
             <div class="bg-green-50 border border-green-200 text-green-600 p-4 rounded-2xl mb-4 text-sm font-bold"><?= e($success) ?></div>
         <?php endif; ?>
 
-        <div id="login-form" class="bg-white p-10 rounded-[2.5rem] shadow-2xl">
+        <div id="login-form" class="<?= $auth_panel === 'login' ? '' : 'hidden' ?> bg-white p-10 rounded-[2.5rem] shadow-2xl">
             <div class="text-center mb-8">
                 <div class="inline-block p-4 bg-indigo-100 rounded-2xl text-indigo-600 mb-4">
                     <i class="fa-solid fa-wallet text-3xl"></i>
@@ -482,18 +689,29 @@ $category_colors = [
             <p class="text-center text-sm text-slate-400 mt-6">계정이 없으신가요?
                 <button onclick="toggleRegister()" class="text-indigo-600 font-bold hover:underline">회원가입</button>
             </p>
+            <p class="text-center text-sm text-slate-400 mt-3">
+                <button onclick="showAuthPanel('recovery')" class="text-slate-600 font-bold hover:underline">회원정보 찾기</button>
+            </p>
         </div>
 
-        <div id="register-form" class="hidden bg-white p-10 rounded-[2.5rem] shadow-2xl">
+        <div id="register-form" class="<?= $auth_panel === 'register' ? '' : 'hidden' ?> bg-white p-10 rounded-[2.5rem] shadow-2xl">
             <div class="text-center mb-8">
                 <h2 class="text-2xl font-black text-slate-800">회원가입</h2>
-                <p class="text-sm text-slate-400 mt-2">기본 회원 정보를 입력해주세요.</p>
+                <p class="text-sm text-slate-400 mt-2">이메일과 휴대폰 인증 후 가입할 수 있어요.</p>
             </div>
             <form method="POST">
-                <input type="text" name="reg_name" placeholder="이름" class="w-full p-4 border rounded-2xl mb-4 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" minlength="2" required>
-                <input type="text" name="reg_username" placeholder="아이디 (4~20자, 영문/숫자/_)" class="w-full p-4 border rounded-2xl mb-4 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" pattern="[A-Za-z0-9_]{4,20}" required>
-                <input type="email" name="reg_email" placeholder="이메일" class="w-full p-4 border rounded-2xl mb-4 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" required>
-                <input type="tel" name="reg_phone" placeholder="전화번호 (예: 010-1234-5678)" class="w-full p-4 border rounded-2xl mb-4 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" pattern="01[016789]-?\d{3,4}-?\d{4}" required>
+                <input type="text" name="reg_name" value="<?= e($form_values['reg_name']) ?>" placeholder="이름" class="w-full p-4 border rounded-2xl mb-4 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" minlength="2" required>
+                <input type="text" name="reg_username" value="<?= e($form_values['reg_username']) ?>" placeholder="아이디 (4~20자, 영문/숫자/_)" class="w-full p-4 border rounded-2xl mb-4 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" pattern="[A-Za-z0-9_]{4,20}" required>
+                <div class="grid grid-cols-[1fr_auto] gap-2 mb-3">
+                    <input type="email" name="reg_email" value="<?= e($form_values['reg_email']) ?>" placeholder="이메일" class="w-full p-4 border rounded-2xl outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" required>
+                    <button name="send_reg_email_code" formnovalidate class="px-4 bg-indigo-50 text-indigo-600 rounded-2xl font-black text-sm hover:bg-indigo-100">메일인증</button>
+                </div>
+                <input type="text" name="reg_email_code" placeholder="이메일 인증번호 6자리" inputmode="numeric" maxlength="6" class="w-full p-4 border rounded-2xl mb-4 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" required>
+                <div class="grid grid-cols-[1fr_auto] gap-2 mb-3">
+                    <input type="tel" name="reg_phone" value="<?= e($form_values['reg_phone']) ?>" placeholder="전화번호 (예: 010-1234-5678)" class="w-full p-4 border rounded-2xl outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" pattern="01[016789]-?\d{3,4}-?\d{4}" required>
+                    <button name="send_reg_phone_code" formnovalidate class="px-4 bg-indigo-50 text-indigo-600 rounded-2xl font-black text-sm hover:bg-indigo-100">휴대폰인증</button>
+                </div>
+                <input type="text" name="reg_phone_code" placeholder="휴대폰 인증번호 6자리" inputmode="numeric" maxlength="6" class="w-full p-4 border rounded-2xl mb-4 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" required>
                 <input type="password" name="reg_password" placeholder="비밀번호 (8~20자, 영문/숫자/특수문자 포함)" class="w-full p-4 border rounded-2xl mb-4 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" required>
                 <input type="password" name="reg_password_confirm" placeholder="비밀번호 확인" class="w-full p-4 border rounded-2xl mb-2 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" required>
                 <p class="text-xs text-slate-400 mb-6 leading-5">비밀번호는 8~20자이며 영문, 숫자, 특수문자를 각각 1개 이상 포함해야 합니다.</p>
@@ -501,6 +719,37 @@ $category_colors = [
             </form>
             <p class="text-center text-sm text-slate-400 mt-6">
                 <button onclick="toggleRegister()" class="text-indigo-600 font-bold hover:underline">← 로그인으로</button>
+            </p>
+        </div>
+
+        <div id="recovery-form" class="<?= $auth_panel === 'recovery' ? '' : 'hidden' ?> bg-white p-10 rounded-[2.5rem] shadow-2xl">
+            <div class="text-center mb-8">
+                <h2 class="text-2xl font-black text-slate-800">회원정보 찾기</h2>
+                <p class="text-sm text-slate-400 mt-2">가입한 이메일 인증으로 아이디를 확인하고 비밀번호를 다시 설정할 수 있어요.</p>
+            </div>
+            <form method="POST">
+                <div class="grid grid-cols-[1fr_auto] gap-2 mb-3">
+                    <input type="email" name="find_email" value="<?= e($form_values['find_email']) ?>" placeholder="가입한 이메일" class="w-full p-4 border rounded-2xl outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" required>
+                    <button name="send_recovery_email_code" formnovalidate class="px-4 bg-indigo-50 text-indigo-600 rounded-2xl font-black text-sm hover:bg-indigo-100">메일인증</button>
+                </div>
+                <input type="text" name="recovery_email_code" placeholder="이메일 인증번호 6자리" inputmode="numeric" maxlength="6" class="w-full p-4 border rounded-2xl mb-4 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" required>
+
+                <?php if ($recovery_result): ?>
+                    <div class="bg-slate-50 border border-slate-100 rounded-2xl p-4 mb-4 text-sm">
+                        <p class="font-black text-slate-800"><?= e($recovery_result['name'] ?: $recovery_result['username']) ?>님의 회원정보</p>
+                        <p class="text-slate-500 mt-2">아이디: <span class="font-bold text-indigo-600"><?= e($recovery_result['username']) ?></span></p>
+                        <p class="text-slate-500">이메일: <?= e($recovery_result['email']) ?></p>
+                        <p class="text-slate-500">휴대폰: <?= e(maskPhone($recovery_result['phone'] ?? '')) ?></p>
+                    </div>
+                <?php endif; ?>
+
+                <input type="password" name="recovery_new_password" placeholder="새 비밀번호 (선택)" class="w-full p-4 border rounded-2xl mb-4 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50">
+                <input type="password" name="recovery_new_password_confirm" placeholder="새 비밀번호 확인" class="w-full p-4 border rounded-2xl mb-2 outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50">
+                <p class="text-xs text-slate-400 mb-6 leading-5">비밀번호 재설정이 필요 없으면 새 비밀번호 칸을 비워두고 확인하면 됩니다.</p>
+                <button name="recover_account" class="w-full py-4 bg-slate-800 text-white rounded-2xl font-bold text-lg hover:bg-slate-900 transition">회원정보 확인하기</button>
+            </form>
+            <p class="text-center text-sm text-slate-400 mt-6">
+                <button onclick="showAuthPanel('login')" class="text-indigo-600 font-bold hover:underline">← 로그인으로</button>
             </p>
         </div>
     </div>
@@ -1059,8 +1308,15 @@ function goBack() {
 }
 
 function toggleRegister() {
-    document.getElementById('login-form').classList.toggle('hidden');
-    document.getElementById('register-form').classList.toggle('hidden');
+    const registerHidden = document.getElementById('register-form').classList.contains('hidden');
+    showAuthPanel(registerHidden ? 'register' : 'login');
+}
+
+function showAuthPanel(panel) {
+    ['login', 'register', 'recovery'].forEach(name => {
+        const el = document.getElementById(`${name}-form`);
+        if (el) el.classList.toggle('hidden', name !== panel);
+    });
 }
 
 // [FIX] 프로필 수정 후 성공 메시지가 있으면 모달 자동 오픈
