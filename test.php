@@ -1,4 +1,9 @@
 <?php
+$host = "mariadb";          // 스크린샷 '내부 연결'에 적힌 이름
+$user = "root";             // 별도로 설정하지 않으셨다면 기본값은 root입니다
+$pw = "4396";      // DB 생성 시 입력했던 비밀번호
+$dbName = "mariadb";    // DB 생성 시 입력했던 데이터베이스 이름
+$port = 3306;               // 마리아DB 기본 포트
 session_start();
 ini_set('display_errors', 1);
 error_reporting(E_ALL);
