@@ -7,7 +7,7 @@ $port = 3306;               // 마리아DB 기본 포트
 session_start();
 ini_set('display_errors', 1);
 error_reporting(E_ALL);
-$conn = new mysqli("localhost", "root", "", "travel_db");
+$conn = new mysqli($host, $user, $pw, $dbName, $port);
 $conn->set_charset("utf8mb4");
 
 // 테이블 생성
