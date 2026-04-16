@@ -80,6 +80,18 @@ function verify_csrf(): bool {
     return isset($_POST['csrf_token']) && $_POST['csrf_token'] === ($_SESSION['csrf_token'] ?? '');
 }
 
+function utf8_length(string $value): int {
+    if (function_exists('mb_strlen')) {
+        return mb_strlen($value, 'UTF-8');
+    }
+
+    if (preg_match_all('/./us', $value, $matches) !== false) {
+        return count($matches[0]);
+    }
+
+    return strlen($value);
+}
+
 function isValidPassword(string $password): bool {
     return (bool) preg_match('/^(?=.*[A-Za-z])(?=.*\\d)(?=.*[!@#$%^&*()_+\-=\[\]{};:\\|,.<>\/?]).{8,20}$/', $password);
 }
@@ -101,7 +113,7 @@ if (isset($_POST['register'])) {
     $password_raw = $_POST['reg_password'] ?? '';
     $password_confirm_raw = $_POST['reg_password_confirm'] ?? '';
 
-    if ($name_raw === '' || mb_strlen($name_raw) < 2) {
+    if ($name_raw === '' || utf8_length($name_raw) < 2) {
         $error = '이름은 2자 이상 입력해주세요.';
     } elseif (!isValidUsername($username_raw)) {
         $error = '아이디는 4~20자의 영문, 숫자, 밑줄(_)만 사용할 수 있습니다.';
@@ -198,7 +210,7 @@ if (isset($_POST['update_profile'])) {
 
         if (!$currentUser) {
             $error = '사용자 정보를 찾을 수 없습니다.';
-        } elseif ($name_raw === '' || mb_strlen($name_raw) < 2) {
+        } elseif ($name_raw === '' || utf8_length($name_raw) < 2) {
             $error = '이름은 2자 이상 입력해주세요.';
         } elseif (!isValidUsername($username_raw)) {
             $error = '아이디는 4~20자의 영문, 숫자, 밑줄(_)만 사용할 수 있습니다.';
